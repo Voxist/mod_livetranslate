@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build module
+        run: |
+          docker build -t mod_livetranslate_builder .
+
+      - name: Extract module
+        run: |
+          mkdir -p build_output
+          CONTAINER_ID=$(docker create mod_livetranslate_builder)
+          docker cp "${CONTAINER_ID}:/mod_livetranslate.so" build_output/
+          docker rm "${CONTAINER_ID}"
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create tarball
+        run: |
+          cd build_output
+          tar -czvf mod_livetranslate-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz mod_livetranslate.so
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build_output/mod_livetranslate-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz
+            build_output/mod_livetranslate.so
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build module
+        run: |
+          docker build -t mod_livetranslate_builder .
+
+      - name: Extract module
+        run: |
+          mkdir -p build_output
+          CONTAINER_ID=$(docker create mod_livetranslate_builder)
+          docker cp "${CONTAINER_ID}:/mod_livetranslate.so" build_output/
+          docker rm "${CONTAINER_ID}"
+
+      - name: Verify build
+        run: |
+          ls -la build_output/
+          file build_output/mod_livetranslate.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mod_livetranslate-${{ github.sha }}
+          path: build_output/mod_livetranslate.so
+          retention-days: 30
+
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,style,performance \
+            --suppress=missingIncludeSystem \
+            --error-exitcode=1 \
+            *.c *.h

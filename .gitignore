@@ -1,0 +1,47 @@
+# Build outputs
+*.o
+*.so
+*.la
+*.lo
+*.a
+
+# Build directories
+build_output/
+.libs/
+
+# Autotools generated files
+Makefile.in
+aclocal.m4
+autom4te.cache/
+config.guess
+config.h
+config.h.in
+config.h.in~
+config.log
+config.status
+config.sub
+configure
+depcomp
+install-sh
+libtool
+ltmain.sh
+missing
+stamp-h1
+.deps/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+*.dSYM/
+core
+core.*
+
+# Package files
+*.tar.gz
+*.zip
