@@ -277,6 +277,13 @@ static void agc_process_ramp(livetranslate_session_t *lt)
         return;
     }
 
+    /* Optimization: only check time every 2 frames (~40ms at 20ms/frame)
+     * This reduces syscalls while still being responsive enough for AGC ramp */
+    lt->frame_counter++;
+    if ((lt->frame_counter & 1) != 0) {
+        return; /* Skip odd frames */
+    }
+
     now = switch_micro_time_now();
     elapsed_ms = (int)((now - lt->agc_ramp_start) / 1000);
 
@@ -379,18 +386,21 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
                 /* Safety: ensure chunk len matches frame if present */
                 if (chunk && chunk->len < samples * 2) samples = chunk->len / 2;
 
+                /* Convert gains to Q16 fixed-point for faster integer math */
+                int32_t orig_gain_q16 = (int32_t)(lt->original_gain * 65536.0f);
+                int32_t trans_gain_q16 = (int32_t)(lt->translated_gain * 65536.0f);
+
                 for (uint32_t i = 0; i < samples; i++) {
-                    /* Original attenuated */
-                    int32_t mixed = (int32_t)(data[i] * lt->original_gain);
+                    /* Original attenuated using fixed-point multiply */
+                    int32_t mixed = (data[i] * orig_gain_q16) >> 16;
 
                     /* Add translation if available */
                     if (trans_data) {
-                        mixed += (int32_t)(trans_data[i] * lt->translated_gain);
+                        mixed += (trans_data[i] * trans_gain_q16) >> 16;
                     }
 
-                    /* Clip */
-                    if (mixed > 32767) mixed = 32767;
-                    if (mixed < -32768) mixed = -32768;
+                    /* Branchless clamp using ternary (compiler optimizes well) */
+                    mixed = (mixed > 32767) ? 32767 : ((mixed < -32768) ? -32768 : mixed);
 
                     data[i] = (int16_t)mixed;
                 }
@@ -431,30 +441,41 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
                          }
                      }
                      
-                     // Resample
+                     // Resample using pre-allocated buffer
                      spx_uint32_t in_len = frame->samples;
-                     spx_uint32_t out_len = in_len * 16000 / frame->rate + 100; // buffer size
-                     
-                     int16_t *out_buf = (int16_t *)malloc(out_len * 2); // temporary buffer
+                     spx_uint32_t out_len = in_len * 16000 / frame->rate + LT_RESAMPLE_BUFFER_MARGIN;
+                     size_t needed_size = out_len * sizeof(int16_t);
 
-                     if (out_buf) {
+                     // Grow resample buffer if needed (rare after first frame)
+                     if (needed_size > lt->resample_buffer_size) {
+                         int16_t *new_buf = realloc(lt->resample_buffer, needed_size);
+                         if (new_buf) {
+                             lt->resample_buffer = new_buf;
+                             lt->resample_buffer_size = needed_size;
+                         } else {
+                             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lt->fs_session),
+                                 SWITCH_LOG_ERROR, "Failed to allocate resample buffer\n");
+                             break;
+                         }
+                     }
+
+                     if (lt->resample_buffer) {
                         speex_resampler_process_interleaved_int(lt->resampler,
                             (const spx_int16_t *)frame->data,
                             &in_len,
-                            (spx_int16_t *)out_buf,
+                            (spx_int16_t *)lt->resample_buffer,
                             &out_len);
 
                         // Wrap in outgoing_pcm_chunk_t with actual length
-                        size_t actual_len = out_len * 2; // bytes = samples * 2
+                        size_t actual_len = out_len * sizeof(int16_t);
                         outgoing_pcm_chunk_t *chunk = malloc(sizeof(outgoing_pcm_chunk_t) + actual_len);
                         if (chunk) {
                             chunk->len = actual_len;
-                            memcpy(chunk->data, out_buf, actual_len);
+                            memcpy(chunk->data, lt->resample_buffer, actual_len);
                             if (switch_queue_trypush(lt->outgoing_pcm_queue, chunk) != SWITCH_STATUS_SUCCESS) {
                                 free(chunk);
                             }
                         }
-                        free(out_buf);
                      }
                 } else {
                     // 16k, wrap in outgoing_pcm_chunk_t
@@ -479,6 +500,12 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
         if (lt->resampler) {
             speex_resampler_destroy(lt->resampler);
             lt->resampler = NULL;
+        }
+        /* Free pre-allocated resample buffer */
+        if (lt->resample_buffer) {
+            free(lt->resample_buffer);
+            lt->resample_buffer = NULL;
+            lt->resample_buffer_size = 0;
         }
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lt->fs_session), SWITCH_LOG_DEBUG, "Audio Bug CLOSE\n");
         break;
@@ -543,6 +570,11 @@ SWITCH_STANDARD_API(livetranslate_start_function)
         lt->agc_ramp_up_ms = 500;       /* Default ramp duration */
         lt->agc_ramp_step_ms = 50;      /* Step interval */
         lt->agc_translation_active = SWITCH_FALSE;
+
+        /* Pre-allocated resample buffer (will grow as needed) */
+        lt->resample_buffer = NULL;
+        lt->resample_buffer_size = 0;
+        lt->frame_counter = 0;
 
         /* Parse Params with validation */
         if (params) {

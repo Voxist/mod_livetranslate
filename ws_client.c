@@ -316,7 +316,15 @@ static void *SWITCH_THREAD_FUNC ws_thread_run(switch_thread_t *thread, void *obj
 
     int n = 0;
     while (lt->running && n >= 0) {
-        n = lws_service(context, LT_WS_SERVICE_TIMEOUT_MS);
+        /* Adaptive timeout based on queue activity:
+         * - Heavy load (>10 items): 0ms (immediate return, max throughput)
+         * - Active (1-10 items): 10ms (responsive but efficient)
+         * - Idle (0 items): 100ms (low CPU when nothing to do)
+         */
+        unsigned int queue_size = switch_queue_size(lt->outgoing_pcm_queue);
+        int timeout_ms = (queue_size > 10) ? 0 : (queue_size > 0) ? 10 : 100;
+
+        n = lws_service(context, timeout_ms);
     }
 
     lws_context_destroy(context);
