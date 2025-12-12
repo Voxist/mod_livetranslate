@@ -95,6 +95,29 @@ static int parse_ws_url(const char *url, char *host, size_t host_len,
     return 0;
 }
 
+/**
+ * Fire a LIVETRANSLATE custom event with common headers.
+ * Helper to reduce code duplication in event handling.
+ *
+ * @param lt          Session context
+ * @param subclass    Event subclass (e.g., "LIVETRANSLATE", "LIVETRANSLATE_ERROR")
+ * @return Created event or NULL on failure (caller must fire and not free)
+ */
+static switch_event_t *create_livetranslate_event(livetranslate_session_t *lt, const char *subclass)
+{
+    switch_event_t *event = NULL;
+
+    if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, subclass) == SWITCH_STATUS_SUCCESS) {
+        switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Unique-ID", lt->uuid_str);
+        switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Session-ID", lt->session_id);
+        if (lt->direction) {
+            switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Direction", lt->direction);
+        }
+    }
+
+    return event;
+}
+
 // LWS protocols
 enum {
     PROTOCOL_LIVETRANSLATE,
@@ -117,7 +140,7 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
     case LWS_CALLBACK_CLIENT_ESTABLISHED:
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "WS connected\n");
         if (lt) {
-            lt->ws_connected = SWITCH_TRUE;
+            lt_set_ws_connected(lt, SWITCH_TRUE);
             lws_callback_on_writable(wsi);
             
             // Send Config
@@ -179,39 +202,38 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
                 const cJSON *type = cJSON_GetObjectItem(json, "type");
                 if (type && type->valuestring) {
                     if (!strcmp(type->valuestring, "caption")) {
-                        // Emit Custom Event
-                        switch_event_t *event;
-                        if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "LIVETRANSLATE") == SWITCH_STATUS_SUCCESS) {
-                            switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Unique-ID", lt->uuid_str);
-                            switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Session-ID", lt->session_id);
-                            switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Direction", lt->direction);
-                            
+                        /* Emit caption event using helper */
+                        switch_event_t *event = create_livetranslate_event(lt, "LIVETRANSLATE");
+                        if (event) {
                             cJSON *mode = cJSON_GetObjectItem(json, "mode");
-                            if (mode) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Mode", mode->valuestring);
-                            
+                            if (mode && mode->valuestring) {
+                                switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Mode", mode->valuestring);
+                            }
                             cJSON *src = cJSON_GetObjectItem(json, "src_text");
-                            if (src) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Src-Text", src->valuestring);
-                            
+                            if (src && src->valuestring) {
+                                switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Src-Text", src->valuestring);
+                            }
                             cJSON *dst = cJSON_GetObjectItem(json, "dst_text");
-                            if (dst) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Dst-Text", dst->valuestring);
-                            
-                            // Also add body as raw JSON?
+                            if (dst && dst->valuestring) {
+                                switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Dst-Text", dst->valuestring);
+                            }
                             switch_event_add_body(event, "%.*s", (int)len, (char *)in);
-                            
                             switch_event_fire(&event);
                         }
                     } else if (!strcmp(type->valuestring, "error")) {
                         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Livetranslate Error: %.*s\n", (int)len, (char *)in);
-                        // Fire error event
-                        switch_event_t *event;
-                        if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "LIVETRANSLATE_ERROR") == SWITCH_STATUS_SUCCESS) {
-                             switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Unique-ID", lt->uuid_str);
-                             switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Session-ID", lt->session_id);
-                             cJSON *code = cJSON_GetObjectItem(json, "code");
-                             if (code) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Error-Code", code->valuestring);
-                             cJSON *msg = cJSON_GetObjectItem(json, "message");
-                             if (msg) switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Error-Message", msg->valuestring);
-                             switch_event_fire(&event);
+                        /* Emit error event using helper */
+                        switch_event_t *event = create_livetranslate_event(lt, "LIVETRANSLATE_ERROR");
+                        if (event) {
+                            cJSON *code = cJSON_GetObjectItem(json, "code");
+                            if (code && code->valuestring) {
+                                switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Error-Code", code->valuestring);
+                            }
+                            cJSON *msg = cJSON_GetObjectItem(json, "message");
+                            if (msg && msg->valuestring) {
+                                switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Error-Message", msg->valuestring);
+                            }
+                            switch_event_fire(&event);
                         }
                     }
                 }
@@ -221,7 +243,7 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
         break;
 
     case LWS_CALLBACK_CLIENT_WRITEABLE:
-        if (lt && lt->running) {
+        if (lt && lt_get_running(lt)) {
             void *pop;
             if (switch_queue_trypop(lt->outgoing_pcm_queue, &pop) == SWITCH_STATUS_SUCCESS) {
                 if (pop) {
@@ -257,7 +279,7 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
 
     case LWS_CALLBACK_CLOSED:
     case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-        if (lt) lt->ws_connected = SWITCH_FALSE;
+        if (lt) lt_set_ws_connected(lt, SWITCH_FALSE);
         break;
 
     default:
@@ -331,7 +353,12 @@ static void *SWITCH_THREAD_FUNC ws_thread_run(switch_thread_t *thread, void *obj
     i.path = path;
     i.host = host;
     i.origin = host;
-    i.ssl_connection = use_ssl ? (LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK) : 0;
+    /* TLS configuration: Use proper certificate validation by default.
+     * LCCSCF_ALLOW_SELFSIGNED and LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK
+     * are intentionally NOT used to prevent MITM attacks.
+     * If self-signed certs are needed for development, configure the
+     * system CA store to trust them instead of weakening TLS security. */
+    i.ssl_connection = use_ssl ? LCCSCF_USE_SSL : 0;
     i.protocol = protocols[0].name;
     i.pwsi = (struct lws **)&lt->ws_handle;
     i.userdata = lt;
@@ -339,7 +366,7 @@ static void *SWITCH_THREAD_FUNC ws_thread_run(switch_thread_t *thread, void *obj
     lws_client_connect_via_info(&i);
 
     int n = 0;
-    while (lt->running && n >= 0) {
+    while (lt_get_running(lt) && n >= 0) {
         /* Adaptive timeout based on queue activity:
          * - Heavy load (>10 items): 0ms (immediate return, max throughput)
          * - Active (1-10 items): 10ms (responsive but efficient)
@@ -364,7 +391,7 @@ switch_status_t ws_client_start(livetranslate_session_t *lt)
 switch_status_t ws_client_stop(livetranslate_session_t *lt)
 {
     switch_status_t st;
-    lt->running = SWITCH_FALSE;
+    lt_set_running(lt, SWITCH_FALSE);
     switch_thread_join(&st, lt->ws_send_thread);
     return SWITCH_STATUS_SUCCESS;
 }

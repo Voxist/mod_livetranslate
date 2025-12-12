@@ -336,6 +336,39 @@ static void agc_cleanup(livetranslate_session_t *lt)
     }
 }
 
+/**
+ * Mix original audio with translated audio using Q16 fixed-point math.
+ * Applies gains and clamps output to prevent clipping.
+ *
+ * @param data        Original audio samples (modified in place)
+ * @param trans_data  Translated audio samples (may be NULL)
+ * @param samples     Number of samples to process
+ * @param orig_gain   Linear gain for original audio (0.0-10.0)
+ * @param trans_gain  Linear gain for translated audio (0.0-10.0)
+ */
+static void mix_audio_with_translation(int16_t *data, const int16_t *trans_data,
+                                        uint32_t samples, float orig_gain, float trans_gain)
+{
+    /* Convert gains to Q16 fixed-point for faster integer math */
+    int32_t orig_gain_q16 = (int32_t)(orig_gain * LT_Q16_SCALE);
+    int32_t trans_gain_q16 = (int32_t)(trans_gain * LT_Q16_SCALE);
+
+    for (uint32_t i = 0; i < samples; i++) {
+        /* Original attenuated using fixed-point multiply */
+        int32_t mixed = (data[i] * orig_gain_q16) >> LT_Q16_SHIFT;
+
+        /* Add translation if available */
+        if (trans_data) {
+            mixed += (trans_data[i] * trans_gain_q16) >> LT_Q16_SHIFT;
+        }
+
+        /* Branchless clamp using ternary (compiler optimizes well) */
+        mixed = (mixed > 32767) ? 32767 : ((mixed < -32768) ? -32768 : mixed);
+
+        data[i] = (int16_t)mixed;
+    }
+}
+
 /* Prototypes */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_livetranslate_shutdown);
 SWITCH_MODULE_LOAD_FUNCTION(mod_livetranslate_load);
@@ -357,16 +390,19 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
     case SWITCH_ABC_TYPE_READ_REPLACE:
     {
         frame = switch_core_media_bug_get_read_replace_frame(bug);
-        if (frame && lt->running && lt->ws_connected) {
+        if (frame && lt_get_running(lt) && lt_get_ws_connected(lt)) {
+            /* Get timestamp once per frame to reduce syscalls (was 3x per frame) */
+            switch_time_t now = switch_micro_time_now();
+
             /* 1. Check for incoming translation audio */
             void *pop = NULL;
             pcm_chunk_t *chunk = NULL;
-            switch_bool_t was_ducking = (switch_micro_time_now() < lt->ducking_until);
+            switch_bool_t was_ducking = (now < lt->ducking_until);
 
             if (switch_queue_trypop(lt->incoming_pcm_queue, &pop) == SWITCH_STATUS_SUCCESS && pop) {
                 chunk = (pcm_chunk_t *)pop;
                 /* Extend ducking timer */
-                lt->ducking_until = switch_micro_time_now() + (lt->ducking_release_ms * 1000);
+                lt->ducking_until = now + (lt->ducking_release_ms * 1000);
 
                 /* AGC: Signal translation start if not already active */
                 if (!lt->agc_translation_active) {
@@ -375,7 +411,6 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
             }
 
             /* 2. Check if we should be ducking (Translation active or in release period) */
-            switch_time_t now = switch_micro_time_now();
             if (now < lt->ducking_until) {
                 /* Apply attenuation to speaker's own channel (they hear their translation) */
                 int16_t *data = (int16_t *)frame->data;
@@ -387,24 +422,9 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
                 /* Safety: ensure chunk len matches frame if present */
                 if (chunk && chunk->len < samples * 2) samples = chunk->len / 2;
 
-                /* Convert gains to Q16 fixed-point for faster integer math */
-                int32_t orig_gain_q16 = (int32_t)(lt->original_gain * 65536.0f);
-                int32_t trans_gain_q16 = (int32_t)(lt->translated_gain * 65536.0f);
-
-                for (uint32_t i = 0; i < samples; i++) {
-                    /* Original attenuated using fixed-point multiply */
-                    int32_t mixed = (data[i] * orig_gain_q16) >> 16;
-
-                    /* Add translation if available */
-                    if (trans_data) {
-                        mixed += (trans_data[i] * trans_gain_q16) >> 16;
-                    }
-
-                    /* Branchless clamp using ternary (compiler optimizes well) */
-                    mixed = (mixed > 32767) ? 32767 : ((mixed < -32768) ? -32768 : mixed);
-
-                    data[i] = (int16_t)mixed;
-                }
+                /* Use extracted helper for audio mixing */
+                mix_audio_with_translation(data, trans_data, samples,
+                                           lt->original_gain, lt->translated_gain);
             } else {
                 /* Ducking just ended - signal AGC to start ramping up */
                 if (was_ducking && lt->agc_translation_active) {
@@ -426,7 +446,7 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
         switch_frame_t read_frame = { 0 };
         if (switch_core_media_bug_read(bug, &read_frame, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS && read_frame.data) {
             frame = &read_frame;
-            if (lt->running && lt->ws_connected) {
+            if (lt_get_running(lt) && lt_get_ws_connected(lt)) {
                 // Resampling
                 if (frame->rate != 16000) {
                      if (!lt->resampler) {
@@ -775,7 +795,7 @@ SWITCH_STANDARD_API(livetranslate_stop_function)
     switch_mutex_unlock(globals.sessions_mutex);
 
     if (lt) {
-        lt->running = SWITCH_FALSE;
+        lt_set_running(lt, SWITCH_FALSE);
 
         /* Restore conference volume before stopping */
         agc_cleanup(lt);

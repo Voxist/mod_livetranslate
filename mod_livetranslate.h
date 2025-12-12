@@ -144,4 +144,41 @@ struct livetranslate_session_s {
 
 extern livetranslate_globals_t globals;
 
+/*
+ * Thread-safe accessors for shared state variables.
+ * These must be used when accessing running/ws_connected from multiple threads.
+ */
+
+/* Get running state (thread-safe) */
+static inline switch_bool_t lt_get_running(livetranslate_session_t *lt) {
+    switch_bool_t val;
+    switch_mutex_lock(lt->mutex);
+    val = lt->running;
+    switch_mutex_unlock(lt->mutex);
+    return val;
+}
+
+/* Set running state (thread-safe) */
+static inline void lt_set_running(livetranslate_session_t *lt, switch_bool_t val) {
+    switch_mutex_lock(lt->mutex);
+    lt->running = val;
+    switch_mutex_unlock(lt->mutex);
+}
+
+/* Get ws_connected state (thread-safe) */
+static inline switch_bool_t lt_get_ws_connected(livetranslate_session_t *lt) {
+    switch_bool_t val;
+    switch_mutex_lock(lt->mutex);
+    val = lt->ws_connected;
+    switch_mutex_unlock(lt->mutex);
+    return val;
+}
+
+/* Set ws_connected state (thread-safe) */
+static inline void lt_set_ws_connected(livetranslate_session_t *lt, switch_bool_t val) {
+    switch_mutex_lock(lt->mutex);
+    lt->ws_connected = val;
+    switch_mutex_unlock(lt->mutex);
+}
+
 #endif
