@@ -278,9 +278,10 @@ static void agc_process_ramp(livetranslate_session_t *lt)
     }
 
     /* Optimization: only check time every 2 frames (~40ms at 20ms/frame)
-     * This reduces syscalls while still being responsive enough for AGC ramp */
-    lt->frame_counter++;
-    if ((lt->frame_counter & 1) != 0) {
+     * This reduces syscalls while still being responsive enough for AGC ramp
+     * Uses dedicated agc_frame_counter to avoid race conditions with other counters */
+    lt->agc_frame_counter++;
+    if ((lt->agc_frame_counter & 1) != 0) {
         return; /* Skip odd frames */
     }
 
@@ -507,6 +508,12 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
             lt->resample_buffer = NULL;
             lt->resample_buffer_size = 0;
         }
+        /* Free pre-allocated WebSocket send buffer */
+        if (lt->ws_send_buffer) {
+            free(lt->ws_send_buffer);
+            lt->ws_send_buffer = NULL;
+            lt->ws_send_buffer_size = 0;
+        }
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lt->fs_session), SWITCH_LOG_DEBUG, "Audio Bug CLOSE\n");
         break;
 
@@ -574,7 +581,13 @@ SWITCH_STANDARD_API(livetranslate_start_function)
         /* Pre-allocated resample buffer (will grow as needed) */
         lt->resample_buffer = NULL;
         lt->resample_buffer_size = 0;
-        lt->frame_counter = 0;
+
+        /* Pre-allocated WebSocket send buffer (will grow as needed) */
+        lt->ws_send_buffer = NULL;
+        lt->ws_send_buffer_size = 0;
+
+        /* AGC frame counter (separate to avoid race conditions) */
+        lt->agc_frame_counter = 0;
 
         /* Parse Params with validation */
         if (params) {

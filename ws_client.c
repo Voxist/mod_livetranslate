@@ -132,14 +132,19 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
             // Options...
             
             char *json_str = cJSON_PrintUnformatted(json);
-            
-            // Send TEXT frame
-            unsigned char *buf = malloc(LWS_PRE + strlen(json_str));
-            memcpy(buf + LWS_PRE, json_str, strlen(json_str));
-            lws_write(wsi, buf + LWS_PRE, strlen(json_str), LWS_WRITE_TEXT);
-            
-            free(buf);
-            free(json_str);
+            if (json_str) {
+                size_t json_len = strlen(json_str);
+                unsigned char *buf = malloc(LWS_PRE + json_len);
+                if (buf) {
+                    memcpy(buf + LWS_PRE, json_str, json_len);
+                    lws_write(wsi, buf + LWS_PRE, json_len, LWS_WRITE_TEXT);
+                    free(buf);
+                } else {
+                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                        "Failed to allocate WebSocket send buffer for config\n");
+                }
+                free(json_str);
+            }
             cJSON_Delete(json);
         }
         break;
@@ -147,18 +152,24 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
     case LWS_CALLBACK_CLIENT_RECEIVE:
         // Handle incoming data (Text or Binary)
         if (lws_frame_is_binary(wsi)) {
-            // PCM
-             if (lt) {
+            // PCM - validate size to prevent DoS via oversized chunks
+            if (len > LT_MAX_PCM_CHUNK_SIZE) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                    "Rejected oversized PCM chunk: %zu bytes (max %d)\n",
+                    len, LT_MAX_PCM_CHUNK_SIZE);
+                break;
+            }
+            if (lt) {
                 // Copy data to incoming queue
                 pcm_chunk_t *chunk = malloc(sizeof(pcm_chunk_t) + len);
                 if (chunk) {
                     chunk->len = len;
                     memcpy(chunk->data, in, len);
-                     if (switch_queue_trypush(lt->incoming_pcm_queue, chunk) != SWITCH_STATUS_SUCCESS) {
+                    if (switch_queue_trypush(lt->incoming_pcm_queue, chunk) != SWITCH_STATUS_SUCCESS) {
                         free(chunk);
-                     }
+                    }
                 }
-             }
+            }
         } else {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "WS RX Text: %.*s\n", (int)len, (char *)in);
             
@@ -216,12 +227,25 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
                 if (pop) {
                     outgoing_pcm_chunk_t *chunk = (outgoing_pcm_chunk_t *)pop;
                     size_t pay_len = chunk->len;
+                    size_t needed_size = LWS_PRE + pay_len;
 
-                    unsigned char *buf = malloc(LWS_PRE + pay_len);
-                    if (buf) {
-                        memcpy(buf + LWS_PRE, chunk->data, pay_len);
-                        lws_write(wsi, buf + LWS_PRE, pay_len, LWS_WRITE_BINARY);
-                        free(buf);
+                    /* Use pre-allocated buffer, grow if needed (rare) */
+                    if (needed_size > lt->ws_send_buffer_size) {
+                        unsigned char *new_buf = realloc(lt->ws_send_buffer, needed_size);
+                        if (new_buf) {
+                            lt->ws_send_buffer = new_buf;
+                            lt->ws_send_buffer_size = needed_size;
+                        } else {
+                            /* Allocation failed, skip this chunk */
+                            free(chunk);
+                            lws_callback_on_writable(wsi);
+                            break;
+                        }
+                    }
+
+                    if (lt->ws_send_buffer) {
+                        memcpy(lt->ws_send_buffer + LWS_PRE, chunk->data, pay_len);
+                        lws_write(wsi, lt->ws_send_buffer + LWS_PRE, pay_len, LWS_WRITE_BINARY);
                     }
                     free(chunk);
 

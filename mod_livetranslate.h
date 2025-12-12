@@ -12,6 +12,16 @@
 #define LT_TARGET_SAMPLE_RATE       16000
 #define LT_RESAMPLE_BUFFER_MARGIN   100
 #define LT_PCM_CHUNK_20MS_BYTES     640   /* 20ms @ 16kHz mono 16-bit */
+#define LT_MAX_PCM_CHUNK_SIZE       (LT_TARGET_SAMPLE_RATE * 2 * 5)  /* 5 seconds max @ 16kHz mono 16-bit = 160000 bytes */
+#define LT_BYTES_PER_SAMPLE         2
+
+/* Fixed-point Q16 math for audio mixing */
+#define LT_Q16_SCALE                65536
+#define LT_Q16_SHIFT                16
+
+/* AGC configuration */
+#define LT_AGC_MIN_LEVEL            -4
+#define LT_AGC_MAX_LEVEL            4
 
 /* Queue sizes - right-sized for real-time audio */
 #define LT_OUTGOING_QUEUE_SIZE      100   /* ~2 seconds @ 20ms frames */
@@ -85,7 +95,13 @@ struct livetranslate_session_s {
     int16_t *resample_buffer;
     size_t resample_buffer_size;
     uint32_t expected_sample_rate;
-    uint32_t frame_counter;
+
+    /* Pre-allocated WebSocket transmission buffer (performance optimization) */
+    unsigned char *ws_send_buffer;
+    size_t ws_send_buffer_size;
+
+    /* Frame counter for AGC optimization (separate from other counters) */
+    uint32_t agc_frame_counter;
     
     // Audio queues
     switch_queue_t *outgoing_pcm_queue;
