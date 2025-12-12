@@ -72,7 +72,7 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
             // Handle events
             cJSON *json = cJSON_Parse((const char *)in);
             if (json) {
-                cJSON *type = cJSON_GetObjectItem(json, "type");
+                const cJSON *type = cJSON_GetObjectItem(json, "type");
                 if (type && type->valuestring) {
                     if (!strcmp(type->valuestring, "caption")) {
                         // Emit Custom Event

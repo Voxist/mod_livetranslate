@@ -128,13 +128,14 @@ static float agc_calc_gain_split(float target_gain, int *conf_level_out)
 static void agc_on_translation_start(livetranslate_session_t *lt)
 {
     int conf_level;
-    float extra_gain;
 
     if (!lt->conf_agc_enabled) return;
 
     lt->agc_translation_active = SWITCH_TRUE;
 
     if (lt->agc_state != AGC_STATE_DUCKED) {
+        float extra_gain;
+
         lt->agc_state = AGC_STATE_DUCKED;
 
         /* Calculate conference level and extra channel gain */
@@ -291,7 +292,7 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
                 uint32_t samples = frame->samples;
 
                 /* If we have a chunk, mix it in */
-                int16_t *trans_data = chunk ? (int16_t *)chunk->data : NULL;
+                const int16_t *trans_data = chunk ? (const int16_t *)chunk->data : NULL;
 
                 /* Safety: ensure chunk len matches frame if present */
                 if (chunk && chunk->len < samples * 2) samples = chunk->len / 2;
@@ -362,7 +363,6 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
                             &out_len);
                         
                         data = out_buf;
-                        len = out_len * 2;
                      }
                 } else {
                     // 16k, just copy
@@ -406,17 +406,17 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
 SWITCH_STANDARD_API(livetranslate_start_function)
 {
     switch_core_session_t *target_session = NULL;
-    char *uuid = NULL, *params = NULL;
+    char *uuid = NULL;
+    const char *params = NULL;
     livetranslate_session_t *lt = NULL;
     switch_status_t status = SWITCH_STATUS_SUCCESS;
     char *argv[10] = { 0 };
-    int argc = 0;
 
     (void)session; /* unused parameter from SWITCH_STANDARD_API macro */
 
     if (!zstr(cmd)) {
         char *mycmd = strdup(cmd);
-        argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
+        int argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
         if (argc > 0) uuid = argv[0];
         if (argc > 1) params = argv[1]; /* This parsing is simplistic, need proper param parsing */
         free(mycmd);
