@@ -1,6 +1,7 @@
 #include "mod_livetranslate.h"
 #include "ws_client.h"
 #include <math.h>
+#include <ctype.h>
 
 livetranslate_globals_t globals;
 
@@ -23,6 +24,72 @@ static const float CONF_LEVEL_GAIN[] = {
  */
 static float db_to_linear(float db) {
     return powf(10.0f, db / 20.0f);
+}
+
+/*
+ * Input validation functions
+ */
+
+/**
+ * Validate language code format (e.g., en-US, fr-FR, zh-CN).
+ * Accepts 2-10 character codes with alphanumeric and hyphen.
+ */
+static switch_bool_t validate_language_code(const char *lang) {
+    size_t len;
+    const char *p;
+
+    if (zstr(lang)) return SWITCH_FALSE;
+
+    len = strlen(lang);
+    if (len < 2 || len > LT_MAX_LANG_CODE_LENGTH) return SWITCH_FALSE;
+
+    /* Allow alphanumeric and hyphen only */
+    for (p = lang; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '-') return SWITCH_FALSE;
+    }
+
+    return SWITCH_TRUE;
+}
+
+/**
+ * Validate WebSocket URL format and length.
+ * Must start with ws:// or wss://.
+ */
+static switch_bool_t validate_ws_url(const char *url) {
+    if (zstr(url)) return SWITCH_FALSE;
+    if (strlen(url) > LT_MAX_URL_LENGTH) return SWITCH_FALSE;
+    if (strncmp(url, "ws://", 5) != 0 && strncmp(url, "wss://", 6) != 0) return SWITCH_FALSE;
+    return SWITCH_TRUE;
+}
+
+/**
+ * Validate identifier for safe use in API commands.
+ * Prevents command injection by allowing only alphanumeric, underscore, hyphen.
+ */
+static switch_bool_t is_safe_identifier(const char *id) {
+    const char *p;
+
+    if (zstr(id)) return SWITCH_FALSE;
+
+    for (p = id; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') return SWITCH_FALSE;
+    }
+
+    return SWITCH_TRUE;
+}
+
+/**
+ * Validate numeric value is within acceptable range.
+ */
+static switch_bool_t validate_numeric_range(int val, int min, int max) {
+    return (val >= min && val <= max);
+}
+
+/**
+ * Validate float gain value is within acceptable range.
+ */
+static switch_bool_t validate_gain(float val) {
+    return (val >= 0.0f && val <= 10.0f);
 }
 
 /**
@@ -59,10 +126,17 @@ static switch_status_t agc_detect_conference(livetranslate_session_t *lt)
 static switch_status_t agc_set_conference_volume(livetranslate_session_t *lt, int level)
 {
     switch_stream_handle_t stream = { 0 };
-    char cmd[256];
+    char *cmd = NULL;
     switch_status_t status;
 
     if (!lt->conf_agc_enabled || zstr(lt->conference_name) || zstr(lt->conference_member_id)) {
+        return SWITCH_STATUS_FALSE;
+    }
+
+    /* Validate identifiers to prevent command injection */
+    if (!is_safe_identifier(lt->conference_name) || !is_safe_identifier(lt->conference_member_id)) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lt->fs_session), SWITCH_LOG_ERROR,
+            "AGC: Invalid conference name or member ID (potential injection attempt)\n");
         return SWITCH_STATUS_FALSE;
     }
 
@@ -72,10 +146,18 @@ static switch_status_t agc_set_conference_volume(livetranslate_session_t *lt, in
 
     SWITCH_STANDARD_STREAM(stream);
 
-    switch_snprintf(cmd, sizeof(cmd), "%s volume_in %s %d",
+    /* Use dynamic allocation to prevent buffer overflow */
+    cmd = switch_mprintf("%s volume_in %s %d",
         lt->conference_name, lt->conference_member_id, level);
 
+    if (!cmd) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(lt->fs_session), SWITCH_LOG_ERROR,
+            "AGC: Failed to allocate command buffer\n");
+        return SWITCH_STATUS_MEMERR;
+    }
+
     status = switch_api_execute("conference", cmd, lt->fs_session, &stream);
+    switch_safe_free(cmd);
 
     if (status == SWITCH_STATUS_SUCCESS) {
         lt->agc_conf_level = level;
@@ -354,30 +436,35 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
                      spx_uint32_t out_len = in_len * 16000 / frame->rate + 100; // buffer size
                      
                      int16_t *out_buf = (int16_t *)malloc(out_len * 2); // temporary buffer
-                     
+
                      if (out_buf) {
-                        speex_resampler_process_interleaved_int(lt->resampler, 
-                            (const spx_int16_t *)frame->data, 
-                            &in_len, 
-                            (spx_int16_t *)out_buf, 
+                        speex_resampler_process_interleaved_int(lt->resampler,
+                            (const spx_int16_t *)frame->data,
+                            &in_len,
+                            (spx_int16_t *)out_buf,
                             &out_len);
-                        
-                        data = out_buf;
+
+                        // Wrap in outgoing_pcm_chunk_t with actual length
+                        size_t actual_len = out_len * 2; // bytes = samples * 2
+                        outgoing_pcm_chunk_t *chunk = malloc(sizeof(outgoing_pcm_chunk_t) + actual_len);
+                        if (chunk) {
+                            chunk->len = actual_len;
+                            memcpy(chunk->data, out_buf, actual_len);
+                            if (switch_queue_trypush(lt->outgoing_pcm_queue, chunk) != SWITCH_STATUS_SUCCESS) {
+                                free(chunk);
+                            }
+                        }
+                        free(out_buf);
                      }
                 } else {
-                    // 16k, just copy
-                    void *p = malloc(len);
-                    if (p) memcpy(p, data, len);
-                    data = p;
-                }
-
-                // Push to queue (data must be malloced and owned by queue consumer now)
-                // Note: if we resampled, data is out_buf which is malloced.
-                // if we didn't, we malloced p.
-                
-                if (data) {
-                    if (switch_queue_trypush(lt->outgoing_pcm_queue, data) != SWITCH_STATUS_SUCCESS) {
-                        free(data);
+                    // 16k, wrap in outgoing_pcm_chunk_t
+                    outgoing_pcm_chunk_t *chunk = malloc(sizeof(outgoing_pcm_chunk_t) + len);
+                    if (chunk) {
+                        chunk->len = len;
+                        memcpy(chunk->data, data, len);
+                        if (switch_queue_trypush(lt->outgoing_pcm_queue, chunk) != SWITCH_STATUS_SUCCESS) {
+                            free(chunk);
+                        }
                     }
                 }
             }
@@ -457,7 +544,7 @@ SWITCH_STANDARD_API(livetranslate_start_function)
         lt->agc_ramp_step_ms = 50;      /* Step interval */
         lt->agc_translation_active = SWITCH_FALSE;
 
-        /* Parse Params */
+        /* Parse Params with validation */
         if (params) {
             char *pdup = strdup(params);
             int ac = 0;
@@ -469,21 +556,97 @@ SWITCH_STANDARD_API(livetranslate_start_function)
                 char *val = strchr(key, '=');
                 if (val) {
                     *val++ = '\0';
-                    if (!strcasecmp(key, "src_lang")) lt->src_lang = switch_core_session_strdup(target_session, val);
-                    else if (!strcasecmp(key, "dst_lang")) lt->dst_lang = switch_core_session_strdup(target_session, val);
+                    if (!strcasecmp(key, "src_lang")) {
+                        if (validate_language_code(val)) {
+                            lt->src_lang = switch_core_session_strdup(target_session, val);
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid src_lang format: %s\n", val);
+                        }
+                    }
+                    else if (!strcasecmp(key, "dst_lang")) {
+                        if (validate_language_code(val)) {
+                            lt->dst_lang = switch_core_session_strdup(target_session, val);
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid dst_lang format: %s\n", val);
+                        }
+                    }
                     else if (!strcasecmp(key, "direction")) lt->direction = switch_core_session_strdup(target_session, val);
                     else if (!strcasecmp(key, "role")) lt->role = switch_core_session_strdup(target_session, val);
-                    else if (!strcasecmp(key, "url")) lt->ws_url = switch_core_session_strdup(target_session, val);
+                    else if (!strcasecmp(key, "url")) {
+                        if (validate_ws_url(val)) {
+                            lt->ws_url = switch_core_session_strdup(target_session, val);
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid WebSocket URL (must be ws:// or wss://): %s\n", val);
+                        }
+                    }
                     else if (!strcasecmp(key, "api_key")) lt->api_key = switch_core_session_strdup(target_session, val);
-                    else if (!strcasecmp(key, "session_id")) lt->session_id = switch_core_session_strdup(target_session, val);
-                    else if (!strcasecmp(key, "original_gain")) lt->original_gain = (float)atof(val);
-                    else if (!strcasecmp(key, "translated_gain")) lt->translated_gain = (float)atof(val);
-                    else if (!strcasecmp(key, "ducking_release_ms")) lt->ducking_release_ms = atoi(val);
+                    else if (!strcasecmp(key, "session_id")) {
+                        if (strlen(val) <= LT_MAX_SESSION_ID_LENGTH) {
+                            lt->session_id = switch_core_session_strdup(target_session, val);
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "session_id too long (max %d chars)\n", LT_MAX_SESSION_ID_LENGTH);
+                        }
+                    }
+                    else if (!strcasecmp(key, "original_gain")) {
+                        float gain = (float)atof(val);
+                        if (validate_gain(gain)) {
+                            lt->original_gain = gain;
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid original_gain (0.0-10.0): %s\n", val);
+                        }
+                    }
+                    else if (!strcasecmp(key, "translated_gain")) {
+                        float gain = (float)atof(val);
+                        if (validate_gain(gain)) {
+                            lt->translated_gain = gain;
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid translated_gain (0.0-10.0): %s\n", val);
+                        }
+                    }
+                    else if (!strcasecmp(key, "ducking_release_ms")) {
+                        int ms = atoi(val);
+                        if (validate_numeric_range(ms, 0, 10000)) {
+                            lt->ducking_release_ms = ms;
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid ducking_release_ms (0-10000): %s\n", val);
+                        }
+                    }
                     /* Conference AGC parameters */
                     else if (!strcasecmp(key, "conf_agc")) lt->conf_agc_enabled = switch_true(val);
-                    else if (!strcasecmp(key, "conf_agc_ducked_db")) lt->agc_ducked_gain = db_to_linear((float)atof(val));
-                    else if (!strcasecmp(key, "conf_agc_ramp_up_ms")) lt->agc_ramp_up_ms = atoi(val);
-                    else if (!strcasecmp(key, "conf_agc_ramp_step_ms")) lt->agc_ramp_step_ms = atoi(val);
+                    else if (!strcasecmp(key, "conf_agc_ducked_db")) {
+                        float db = (float)atof(val);
+                        if (db >= -60.0f && db <= 20.0f) {
+                            lt->agc_ducked_gain = db_to_linear(db);
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid conf_agc_ducked_db (-60 to +20): %s\n", val);
+                        }
+                    }
+                    else if (!strcasecmp(key, "conf_agc_ramp_up_ms")) {
+                        int ms = atoi(val);
+                        if (validate_numeric_range(ms, 10, 5000)) {
+                            lt->agc_ramp_up_ms = ms;
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid conf_agc_ramp_up_ms (10-5000): %s\n", val);
+                        }
+                    }
+                    else if (!strcasecmp(key, "conf_agc_ramp_step_ms")) {
+                        int ms = atoi(val);
+                        if (validate_numeric_range(ms, 5, 500)) {
+                            lt->agc_ramp_step_ms = ms;
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                "Invalid conf_agc_ramp_step_ms (5-500): %s\n", val);
+                        }
+                    }
                 }
             }
             free(pdup);
@@ -496,8 +659,8 @@ SWITCH_STANDARD_API(livetranslate_start_function)
             lt->session_id = switch_core_session_strdup(target_session, buf);
         }
 
-        switch_queue_create(&lt->outgoing_pcm_queue, 1000, lt->pool);
-        switch_queue_create(&lt->incoming_pcm_queue, 1000, lt->pool);
+        switch_queue_create(&lt->outgoing_pcm_queue, LT_OUTGOING_QUEUE_SIZE, lt->pool);
+        switch_queue_create(&lt->incoming_pcm_queue, LT_INCOMING_QUEUE_SIZE, lt->pool);
         switch_mutex_init(&lt->mutex, SWITCH_MUTEX_NESTED, lt->pool);
 
         // Attach media bug

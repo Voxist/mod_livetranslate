@@ -4,10 +4,44 @@
 #include <switch.h>
 #include <speex/speex_resampler.h>
 
+/*
+ * Constants
+ */
+
+/* Audio processing */
+#define LT_TARGET_SAMPLE_RATE       16000
+#define LT_RESAMPLE_BUFFER_MARGIN   100
+#define LT_PCM_CHUNK_20MS_BYTES     640   /* 20ms @ 16kHz mono 16-bit */
+
+/* Queue sizes - right-sized for real-time audio */
+#define LT_OUTGOING_QUEUE_SIZE      100   /* ~2 seconds @ 20ms frames */
+#define LT_INCOMING_QUEUE_SIZE      50    /* ~1 second */
+
+/* WebSocket */
+#define LT_WS_MAX_FRAME_SIZE        1024
+#define LT_WS_SERVICE_TIMEOUT_MS    50
+
+/* Validation limits */
+#define LT_MAX_URL_LENGTH           512
+#define LT_MAX_LANG_CODE_LENGTH     10
+#define LT_MAX_CONFERENCE_ID_LENGTH 128
+#define LT_MAX_SESSION_ID_LENGTH    256
+
+/*
+ * Data structures for audio queues
+ */
+
+/* Incoming PCM chunk (from translation service) */
 typedef struct {
     size_t len;
     unsigned char data[];
 } pcm_chunk_t;
+
+/* Outgoing PCM chunk (to translation service) - includes length for proper handling */
+typedef struct {
+    size_t len;
+    unsigned char data[];
+} outgoing_pcm_chunk_t;
 
 // AGC state machine states
 typedef enum {
@@ -46,6 +80,12 @@ struct livetranslate_session_s {
     switch_mutex_t *mutex;
     SpeexResamplerState *resampler;
     switch_codec_t write_codec;
+
+    /* Pre-allocated resampling buffer (performance optimization) */
+    int16_t *resample_buffer;
+    size_t resample_buffer_size;
+    uint32_t expected_sample_rate;
+    uint32_t frame_counter;
     
     // Audio queues
     switch_queue_t *outgoing_pcm_queue;

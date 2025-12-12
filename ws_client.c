@@ -1,6 +1,99 @@
 #include "ws_client.h"
 #include <libwebsockets.h>
 #include <switch_json.h>
+#include <string.h>
+#include <stdlib.h>
+
+/**
+ * Parse WebSocket URL into components.
+ * Supports ws:// and wss:// schemes.
+ *
+ * @param url       Input URL (e.g., "wss://api.example.com:8443/v1/session")
+ * @param host      Output buffer for hostname
+ * @param host_len  Size of host buffer
+ * @param port      Output pointer for port number
+ * @param path      Output buffer for path
+ * @param path_len  Size of path buffer
+ * @param use_ssl   Output pointer for SSL flag (1=wss, 0=ws)
+ * @return 0 on success, -1 on error
+ */
+static int parse_ws_url(const char *url, char *host, size_t host_len,
+                        int *port, char *path, size_t path_len, int *use_ssl)
+{
+    const char *p = url;
+    const char *host_start, *host_end;
+    const char *port_start = NULL;
+    const char *path_start;
+    size_t host_copy_len;
+
+    if (!url || !host || !port || !path || !use_ssl) {
+        return -1;
+    }
+
+    /* Default values */
+    *use_ssl = 0;
+    *port = 80;
+    path[0] = '/';
+    path[1] = '\0';
+
+    /* Parse scheme */
+    if (strncmp(p, "wss://", 6) == 0) {
+        *use_ssl = 1;
+        *port = 443;
+        p += 6;
+    } else if (strncmp(p, "ws://", 5) == 0) {
+        *use_ssl = 0;
+        *port = 80;
+        p += 5;
+    } else {
+        return -1; /* Invalid scheme */
+    }
+
+    host_start = p;
+
+    /* Find end of host (port separator, path separator, or end of string) */
+    host_end = p;
+    while (*host_end && *host_end != ':' && *host_end != '/') {
+        host_end++;
+    }
+
+    /* Extract port if present */
+    if (*host_end == ':') {
+        port_start = host_end + 1;
+        const char *port_end = port_start;
+        while (*port_end && *port_end != '/') {
+            port_end++;
+        }
+        *port = atoi(port_start);
+        if (*port <= 0 || *port > 65535) {
+            return -1; /* Invalid port */
+        }
+        path_start = port_end;
+    } else {
+        path_start = host_end;
+    }
+
+    /* Copy host */
+    host_copy_len = (size_t)(host_end - host_start);
+    if (host_copy_len >= host_len) {
+        return -1; /* Host too long */
+    }
+    memcpy(host, host_start, host_copy_len);
+    host[host_copy_len] = '\0';
+
+    /* Copy path */
+    if (*path_start == '/') {
+        size_t path_copy_len = strlen(path_start);
+        if (path_copy_len >= path_len) {
+            return -1; /* Path too long */
+        }
+        strncpy(path, path_start, path_len - 1);
+        path[path_len - 1] = '\0';
+    }
+    /* else keep default "/" */
+
+    return 0;
+}
 
 // LWS protocols
 enum {
@@ -121,32 +214,17 @@ static int callback_livetranslate(struct lws *wsi, enum lws_callback_reasons rea
             void *pop;
             if (switch_queue_trypop(lt->outgoing_pcm_queue, &pop) == SWITCH_STATUS_SUCCESS) {
                 if (pop) {
-                    // We assume 320 bytes (20ms 16k mono 16bit) or whatever
-                    // We need to know the size. 
-                    // Issue: Queue stores void*. We don't store length. 
-                    // Assuming fixed length based on resampling target?
-                    // In mod_livetranslate.c we malloced the buffer.
-                    // But we didn't store length. We should maybe store a struct { len, data }.
-                    // Or assume fixed block size if we enforce it in mod_livetranslate.c.
-                    // In mod_livetranslate.c we use `out_len * 2`. 
-                    // Let's fix mod_livetranslate.c to use a struct or consistent size.
-                    
-                    // For now, assuming 20ms 16kHz = 640 bytes (320 samples * 2 bytes).
-                    // If we pushed something else, we are in trouble.
-                    // Let's assume we fix mod_livetranslate to normalize chunk size.
-                    
-                    // But wait, resampling might produce variable size?
-                    // Speex resampler produces `out_len` samples.
-                    
-                    // Let's proceed assuming we can fix that.
-                    
-                    size_t pay_len = 640; // Temporary assumption
+                    outgoing_pcm_chunk_t *chunk = (outgoing_pcm_chunk_t *)pop;
+                    size_t pay_len = chunk->len;
+
                     unsigned char *buf = malloc(LWS_PRE + pay_len);
-                    memcpy(buf + LWS_PRE, pop, pay_len);
-                    lws_write(wsi, buf + LWS_PRE, pay_len, LWS_WRITE_BINARY);
-                    free(buf);
-                    free(pop);
-                    
+                    if (buf) {
+                        memcpy(buf + LWS_PRE, chunk->data, pay_len);
+                        lws_write(wsi, buf + LWS_PRE, pay_len, LWS_WRITE_BINARY);
+                        free(buf);
+                    }
+                    free(chunk);
+
                     lws_callback_on_writable(wsi);
                 }
             }
@@ -181,12 +259,40 @@ static void *SWITCH_THREAD_FUNC ws_thread_run(switch_thread_t *thread, void *obj
     struct lws_context_creation_info info;
     struct lws_context *context;
     struct lws_client_connect_info i;
+    char host[256];
+    char path[256];
+    int port = 0;
+    int use_ssl = 0;
+    const char *ws_url;
+
+    (void)thread; /* unused parameter */
+
+    /* Use configured URL or default */
+    ws_url = lt->ws_url;
+    if (!ws_url || !*ws_url) {
+        ws_url = "ws://localhost:3000/v1/session";
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+            "No WebSocket URL configured, using default: %s\n", ws_url);
+    }
+
+    /* Parse the WebSocket URL */
+    if (parse_ws_url(ws_url, host, sizeof(host), &port, path, sizeof(path), &use_ssl) != 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+            "Failed to parse WebSocket URL: %s\n", ws_url);
+        return NULL;
+    }
+
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+        "Connecting to WebSocket: host=%s port=%d path=%s ssl=%d\n",
+        host, port, path, use_ssl);
 
     memset(&info, 0, sizeof info);
     info.port = CONTEXT_PORT_NO_LISTEN;
     info.protocols = protocols;
     info.gid = -1;
     info.uid = -1;
+    /* Enable SSL/TLS client support */
+    info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
     context = lws_create_context(&info);
     if (!context) {
@@ -196,21 +302,21 @@ static void *SWITCH_THREAD_FUNC ws_thread_run(switch_thread_t *thread, void *obj
 
     memset(&i, 0, sizeof i);
     i.context = context;
-    i.address = "localhost"; // Parse from lt->ws_url
-    i.port = 3000;
-    i.path = "/v1/session";
-    i.host = i.address;
-    i.origin = i.address;
-    i.ssl_connection = 0; // or LCCSCF_USE_SSL
+    i.address = host;
+    i.port = port;
+    i.path = path;
+    i.host = host;
+    i.origin = host;
+    i.ssl_connection = use_ssl ? (LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK) : 0;
     i.protocol = protocols[0].name;
-    i.pwsi = (struct lws **)&lt->ws_handle; // This cast is tricky, ws_handle is void*
+    i.pwsi = (struct lws **)&lt->ws_handle;
     i.userdata = lt;
 
     lws_client_connect_via_info(&i);
 
     int n = 0;
     while (lt->running && n >= 0) {
-        n = lws_service(context, 50);
+        n = lws_service(context, LT_WS_SERVICE_TIMEOUT_MS);
     }
 
     lws_context_destroy(context);
