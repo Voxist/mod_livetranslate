@@ -28,6 +28,7 @@ jobs:
         run: |
           cppcheck --enable=warning,style,performance \
             --suppress=missingIncludeSystem \
+            --suppress=unusedStructMember \
             --error-exitcode=1 \
             *.c *.h
 

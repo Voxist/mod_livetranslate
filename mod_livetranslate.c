@@ -427,10 +427,6 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
         if (switch_core_media_bug_read(bug, &read_frame, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS && read_frame.data) {
             frame = &read_frame;
             if (lt->running && lt->ws_connected) {
-                // ... (Resampling and sending logic remains the same)
-                void *data = frame->data;
-                size_t len = frame->datalen;
-                
                 // Resampling
                 if (frame->rate != 16000) {
                      if (!lt->resampler) {
@@ -479,11 +475,12 @@ static switch_bool_t livetranslate_bug_callback(switch_media_bug_t *bug, void *u
                         }
                      }
                 } else {
-                    // 16k, wrap in outgoing_pcm_chunk_t
+                    // 16k already, wrap in outgoing_pcm_chunk_t
+                    size_t len = frame->datalen;
                     outgoing_pcm_chunk_t *chunk = malloc(sizeof(outgoing_pcm_chunk_t) + len);
                     if (chunk) {
                         chunk->len = len;
-                        memcpy(chunk->data, data, len);
+                        memcpy(chunk->data, frame->data, len);
                         if (switch_queue_trypush(lt->outgoing_pcm_queue, chunk) != SWITCH_STATUS_SUCCESS) {
                             free(chunk);
                         }
